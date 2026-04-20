@@ -46,3 +46,6 @@ To use the interactive notebook:
 - **Debugging**: The script uses a `debug(message)` function for logging internal state and API responses.
 - **Authentication**: Supports both OAuth 2.0 (standard) and Service Account credentials (as a fallback for Sheets).
 - **Data Mapping**: Column indices for the Google Sheet are defined in the `COLS` dictionary within `main.py`.
+
+## License
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

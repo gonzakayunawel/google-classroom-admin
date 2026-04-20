@@ -64,4 +64,4 @@ El ID de la hoja de cálculo está configurado actualmente en `main.py`. Asegúr
 
 ## ⚖️ Licencia
 
-Este proyecto es para uso administrativo interno. Verifica las políticas de tu institución antes de realizar cambios masivos.
+Este proyecto está bajo la Licencia MIT. Consulta el archivo [LICENSE](LICENSE) para más detalles.
