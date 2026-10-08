@@ -52,6 +52,29 @@ python main.py add-student --curso "1°A" --email alumno@colegio.cl
 - `--dry-run` muestra en qué asignaturas se matricularía, sin modificar Classroom.
 - Usa el *CourseID* (columna H de **Asignaturas**), que la carga inicial (`python main.py` o `python main.py create-courses`) escribe automáticamente. Las asignaturas sin *CourseID* se omiten con un aviso.
 
+### Clases huérfanas (profesor eliminado)
+Si se elimina la cuenta de un profesor sin traspasar antes sus clases, estas quedan sin propietario ("Unknown User") y ya no se pueden modificar. Pasados 20 días la cuenta no se puede restaurar desde Admin console.
+
+> Se requiere el scope `classroom.profile.emails`. Si ya tenías un `token.json`, bórralo y vuelve a autorizar. La cuenta debe ser superadministradora.
+
+1. Buscar las clases huérfanas del dominio:
+   ```bash
+   python main.py find-orphans --csv huerfanas.csv
+   ```
+2. Revisar qué se haría con cada una, sin modificar nada:
+   ```bash
+   python main.py fix-orphan --course-id 123456789 --dry-run
+   ```
+3. Recuperarlas (`--course-id` se puede repetir; `--owner` es por defecto la cuenta autenticada):
+   ```bash
+   python main.py fix-orphan --course-id 123456789 --owner aulas@colegio.cl
+   ```
+   Primero se intenta cambiar el propietario por API, lo que conservaría todo el contenido. Si Google lo rechaza, el script explica los cambios y pide autorización (`[s/N]`) antes de crear una clase nueva con los mismos profesores y alumnos, actualizar el *CourseID* en **Asignaturas** e intentar archivar la clase vieja.
+
+   **No se recuperan** las publicaciones, tareas, materiales ni calificaciones, y la clase nueva tiene otro código.
+
+**Para evitarlo:** antes de eliminar a un profesor, suspende su cuenta y traspasa sus clases a otro profesor.
+
 ### Notebook Interactivo
 Si prefieres un entorno más visual o paso a paso, utiliza el archivo:
 `google-classroom-admin.ipynb`

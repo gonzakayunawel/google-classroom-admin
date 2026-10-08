@@ -9,6 +9,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 import json
 import sys
 import argparse
+import csv
 
 # ==============================
 # CONFIGURACIÓN DE CREDENCIALES
@@ -16,6 +17,7 @@ import argparse
 SCOPES = [
     "https://www.googleapis.com/auth/classroom.courses",
     "https://www.googleapis.com/auth/classroom.rosters",
+    "https://www.googleapis.com/auth/classroom.profile.emails",
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
@@ -367,6 +369,274 @@ def add_student(emails, curso, dry_run=False):
     )
 
 
+# ==============================
+# CLASES HUÉRFANAS
+# ==============================
+
+
+def list_all(request_fn, key, **kwargs):
+    """Recorrer todas las páginas de un método list() de la API."""
+    items = []
+    page_token = None
+    while True:
+        response = request_fn(pageToken=page_token, **kwargs).execute()
+        items.extend(response.get(key, []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            return items
+
+
+def member_label(member):
+    """Correo del profesor o alumno, o su userId si no hay correo."""
+    return member.get("profile", {}).get("emailAddress") or member["userId"]
+
+
+def find_orphans(csv_path=None):
+    """Listar las clases activas cuyo propietario ya no existe."""
+    print("Leyendo clases activas del dominio...")
+    courses = list_all(
+        classroom_service.courses().list, "courses", courseStates=["ACTIVE"], pageSize=100
+    )
+    print(f"Leídas {len(courses)} clases activas.")
+
+    owner_status = {}  # ownerId -> "ok" | "huérfana" | "error ..."
+    huerfanas = []
+    no_verificables = []
+
+    for course in courses:
+        owner_id = course["ownerId"]
+        if owner_id not in owner_status:
+            try:
+                profile = classroom_service.userProfiles().get(userId=owner_id).execute()
+                owner_status[owner_id] = "ok" if profile.get("emailAddress") else "huérfana"
+            except HttpError as e:
+                if e.resp.status == 404:
+                    owner_status[owner_id] = "huérfana"
+                else:
+                    owner_status[owner_id] = f"error {e.resp.status}"
+
+        if owner_status[owner_id] == "huérfana":
+            huerfanas.append(course)
+        elif owner_status[owner_id] != "ok":
+            no_verificables.append((course, owner_status[owner_id]))
+
+    filas = []
+    for course in huerfanas:
+        teachers = list_all(
+            classroom_service.courses().teachers().list, "teachers", courseId=course["id"]
+        )
+        students = list_all(
+            classroom_service.courses().students().list, "students", courseId=course["id"]
+        )
+        profesores = [member_label(t) for t in teachers if t["userId"] != course["ownerId"]]
+        filas.append(
+            {
+                "CourseID": course["id"],
+                "Nombre": course.get("name", ""),
+                "Sección": course.get("section", ""),
+                "Profesores": " ".join(profesores),
+                "Alumnos": len(students),
+            }
+        )
+        print(
+            f"\n{course['id']}  {course.get('name', '')} / {course.get('section', '')}\n"
+            f"    Profesores: {', '.join(profesores) or '(ninguno)'}\n"
+            f"    Alumnos: {len(students)}"
+        )
+
+    for course, status in no_verificables:
+        print(
+            f"No se pudo verificar el propietario de {course['id']} "
+            f"({course.get('name', '')}): {status}"
+        )
+
+    print(f"\nResumen: {len(huerfanas)} clases huérfanas, {len(no_verificables)} sin verificar")
+
+    if csv_path:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["CourseID", "Nombre", "Sección", "Profesores", "Alumnos"]
+            )
+            writer.writeheader()
+            writer.writerows(filas)
+        print(f"Listado guardado en {csv_path}")
+
+
+def add_member(resource, course_id, user_id):
+    """Añadir un profesor o alumno. Devuelve 'ok', 'existe' o el mensaje de error."""
+    try:
+        resource.create(courseId=course_id, body={"userId": user_id}).execute()
+        return "ok"
+    except HttpError as e:
+        if e.resp.status == 409:
+            return "existe"
+        return str(e)
+
+
+def try_transfer(course, teachers, owner_profile):
+    """Intentar el cambio de propietario por API. Devuelve None si funcionó, o el error."""
+    course_id = course["id"]
+    try:
+        if owner_profile["id"] not in {t["userId"] for t in teachers}:
+            classroom_service.courses().teachers().create(
+                courseId=course_id, body={"userId": owner_profile["id"]}
+            ).execute()
+        classroom_service.courses().patch(
+            id=course_id, updateMask="ownerId", body={"ownerId": owner_profile["id"]}
+        ).execute()
+        return None
+    except HttpError as e:
+        return str(e)
+
+
+def find_sheet_row(course_id):
+    """Fila (1-indexada) de 'Asignaturas' cuyo CourseID coincide, o None."""
+    for fila, curso in enumerate(cursos):
+        if curso[COLS["CourseID"]].strip() == course_id:
+            return fila + 2
+    return None
+
+
+def explain_rebuild(course, profesores, alumnos_clase, owner_email, sheet_row, motivo):
+    """Explicar qué hará la reconstrucción y qué se pierde. motivo=None en dry-run."""
+    nombre = f"{course.get('name', '')} / {course.get('section', '')}"
+    if motivo is None:
+        print(f"\n[dry-run] Primero se intentará cambiar el propietario de '{nombre}' (ID: {course['id']}).")
+        print("\nSi ese cambio falla y lo autorizas, se hará lo siguiente:")
+    else:
+        print(f"\nNo se pudo cambiar el propietario de '{nombre}' (ID: {course['id']}).")
+        print(f"Motivo: {motivo}")
+        print("\nSi continúas, se hará lo siguiente:")
+    print(f"  1. Crear una clase nueva '{nombre}' con propietario {owner_email}.")
+    print(f"  2. Añadir {len(profesores)} profesores: {', '.join(profesores) or '(ninguno)'}")
+    print(f"  3. Añadir {len(alumnos_clase)} alumnos:")
+    for alumno in alumnos_clase:
+        print(f"       - {alumno}")
+    if sheet_row:
+        print(f"  4. Reemplazar el CourseID en la fila {sheet_row} de 'Asignaturas' por el de la clase nueva.")
+    else:
+        print("  4. (No hay fila en 'Asignaturas' con este CourseID; el Sheet no se modifica.)")
+    print(f"  5. Intentar archivar la clase vieja (ID: {course['id']}).")
+    print("\nLo que NO se recupera:")
+    print("  - Publicaciones, tareas, materiales y calificaciones de la clase vieja no se copian.")
+    print("  - La clase nueva tendrá otro código de clase.")
+    print("  - Los alumnos verán la clase nueva; la vieja quedará archivada si Google lo permite.")
+
+
+def rebuild_course(course, teachers, students, owner_profile, sheet_row):
+    """Crear la clase nueva, copiar profesores y alumnos, actualizar el Sheet y archivar la vieja."""
+    course_data = {
+        key: course[key]
+        for key in ["name", "section", "descriptionHeading", "description", "room"]
+        if course.get(key)
+    }
+    course_data["ownerId"] = owner_profile["id"]
+    course_data["courseState"] = "ACTIVE"
+
+    new_course = classroom_service.courses().create(body=course_data).execute()
+    new_id = new_course["id"]
+    print(f"Clase nueva creada: {new_course['name']} (ID: {new_id})")
+
+    errores = 0
+    excluidos = {course["ownerId"], owner_profile["id"]}
+    for resource, miembros, tipo in [
+        (classroom_service.courses().teachers(), teachers, "Profesor"),
+        (classroom_service.courses().students(), students, "Alumno"),
+    ]:
+        for miembro in miembros:
+            if miembro["userId"] in excluidos:
+                continue
+            resultado = add_member(resource, new_id, miembro["userId"])
+            if resultado == "ok":
+                print(f"{tipo} {member_label(miembro)} añadido")
+            elif resultado == "existe":
+                print(f"{tipo} {member_label(miembro)} ya estaba en la clase")
+            else:
+                print(f"Error añadiendo {tipo.lower()} {member_label(miembro)}: {resultado}")
+                errores += 1
+
+    if sheet_row:
+        try:
+            sheet_cursos.update_cell(sheet_row, COLS["CourseID"] + 1, new_id)
+            print(f"CourseID actualizado en la fila {sheet_row} de 'Asignaturas'")
+        except Exception as e:
+            print(f"Error actualizando ID en la hoja: {e}")
+            errores += 1
+
+    try:
+        classroom_service.courses().patch(
+            id=course["id"], updateMask="courseState", body={"courseState": "ARCHIVED"}
+        ).execute()
+        print(f"Clase vieja {course['id']} archivada")
+    except HttpError as e:
+        print(f"No se pudo archivar la clase vieja {course['id']}: {e}")
+
+    return new_id, errores
+
+
+def fix_orphans(course_ids, owner="me", dry_run=False):
+    """Traspasar o, con autorización, reconstruir clases huérfanas."""
+    owner_profile = classroom_service.userProfiles().get(userId=owner).execute()
+    owner_email = owner_profile.get("emailAddress", owner)
+    print(f"Nuevo propietario: {owner_email}")
+    resultados = []
+
+    for course_id in course_ids:
+        print(f"\n--- Clase {course_id} ---")
+        try:
+            course = classroom_service.courses().get(id=course_id).execute()
+            teachers = list_all(
+                classroom_service.courses().teachers().list, "teachers", courseId=course_id
+            )
+            students = list_all(
+                classroom_service.courses().students().list, "students", courseId=course_id
+            )
+        except HttpError as e:
+            print(f"No se pudo leer la clase {course_id}: {e}")
+            resultados.append((course_id, "error al leer"))
+            continue
+
+        if dry_run:
+            motivo = None
+        else:
+            motivo = try_transfer(course, teachers, owner_profile)
+            if motivo is None:
+                print(f"Propietario cambiado a {owner_email}. La clase conserva todo su contenido.")
+                resultados.append((course_id, "traspasada"))
+                continue
+
+        excluidos = {course["ownerId"], owner_profile["id"]}
+        profesores = [member_label(t) for t in teachers if t["userId"] not in excluidos]
+        alumnos_clase = [member_label(s) for s in students]
+        sheet_row = find_sheet_row(course_id)
+        explain_rebuild(course, profesores, alumnos_clase, owner_email, sheet_row, motivo)
+
+        if dry_run:
+            resultados.append((course_id, "dry-run"))
+            continue
+
+        try:
+            respuesta = input("\n¿Crear la clase nueva? [s/N] ").strip().lower()
+        except EOFError:
+            respuesta = ""
+        if respuesta != "s":
+            print("No se hizo ningún cambio en esta clase.")
+            resultados.append((course_id, "rechazada por el usuario"))
+            continue
+
+        try:
+            new_id, errores = rebuild_course(course, teachers, students, owner_profile, sheet_row)
+            estado = f"reconstruida (ID nuevo: {new_id}, {errores} errores)"
+        except HttpError as e:
+            print(f"Error creando la clase nueva: {e}")
+            estado = "error al reconstruir"
+        resultados.append((course_id, estado))
+
+    print("\nResumen:")
+    for course_id, estado in resultados:
+        print(f"  {course_id}: {estado}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Administración de Google Classroom")
     subparsers = parser.add_subparsers(dest="command")
@@ -391,6 +661,30 @@ def parse_args():
         "--dry-run", action="store_true", help="Mostrar qué se haría sin modificar Classroom"
     )
 
+    orphans_parser = subparsers.add_parser(
+        "find-orphans", help="Listar las clases activas cuyo propietario ya no existe"
+    )
+    orphans_parser.add_argument("--csv", help="Guardar el listado en este archivo CSV")
+
+    fix_parser = subparsers.add_parser(
+        "fix-orphan",
+        help="Traspasar una clase huérfana o, con autorización, reconstruirla",
+    )
+    fix_parser.add_argument(
+        "--course-id",
+        action="append",
+        required=True,
+        help="ID de la clase huérfana (se puede repetir para varias clases)",
+    )
+    fix_parser.add_argument(
+        "--owner",
+        default="me",
+        help="Correo del nuevo propietario (por defecto, la cuenta autenticada)",
+    )
+    fix_parser.add_argument(
+        "--dry-run", action="store_true", help="Mostrar qué se haría sin modificar Classroom"
+    )
+
     return parser.parse_args()
 
 
@@ -398,9 +692,19 @@ if __name__ == "__main__":
     args = parse_args()
     print(f"Usando archivo de credenciales: {CLIENT_SECRET_FILE}")
     init_services()
+
+    if args.command == "find-orphans":
+        print("=== Buscando clases huérfanas ===")
+        find_orphans(args.csv)
+        print("=== Programa finalizado ===")
+        sys.exit(0)
+
     load_sheets()
 
-    if args.command == "add-student":
+    if args.command == "fix-orphan":
+        print("=== Recuperando clases huérfanas ===")
+        fix_orphans(args.course_id, owner=args.owner, dry_run=args.dry_run)
+    elif args.command == "add-student":
         print("=== Añadiendo estudiantes a Google Classroom ===")
         add_student(args.email, args.curso, dry_run=args.dry_run)
     else:
