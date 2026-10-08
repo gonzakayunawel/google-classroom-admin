@@ -399,47 +399,57 @@ def find_orphans(csv_path=None):
     )
     print(f"Leídas {len(courses)} clases activas.")
 
-    owner_status = {}  # ownerId -> "ok" | "huérfana" | "error ..."
+    # Una cuenta eliminada responde 403 o 404 al pedir su perfil. Un 403 también puede ser
+    # un usuario de otro dominio, así que además se exige que el propietario ya no figure
+    # entre los profesores de la clase.
+    owner_status = {}  # ownerId -> "ok" | "inaccesible" | "error ..."
     huerfanas = []
     no_verificables = []
+    filas = []
 
     for course in courses:
         owner_id = course["ownerId"]
         if owner_id not in owner_status:
             try:
                 profile = classroom_service.userProfiles().get(userId=owner_id).execute()
-                owner_status[owner_id] = "ok" if profile.get("emailAddress") else "huérfana"
+                owner_status[owner_id] = "ok" if profile.get("emailAddress") else "inaccesible"
             except HttpError as e:
-                if e.resp.status == 404:
-                    owner_status[owner_id] = "huérfana"
+                if e.resp.status in (403, 404):
+                    owner_status[owner_id] = "inaccesible"
                 else:
                     owner_status[owner_id] = f"error {e.resp.status}"
 
-        if owner_status[owner_id] == "huérfana":
-            huerfanas.append(course)
-        elif owner_status[owner_id] != "ok":
+        if owner_status[owner_id] == "ok":
+            continue
+        if owner_status[owner_id] != "inaccesible":
             no_verificables.append((course, owner_status[owner_id]))
+            continue
 
-    filas = []
-    for course in huerfanas:
         teachers = list_all(
             classroom_service.courses().teachers().list, "teachers", courseId=course["id"]
         )
+        if owner_id in {t["userId"] for t in teachers}:
+            no_verificables.append((course, "perfil inaccesible, pero sigue como profesor"))
+            continue
+
+        huerfanas.append(course)
         students = list_all(
             classroom_service.courses().students().list, "students", courseId=course["id"]
         )
-        profesores = [member_label(t) for t in teachers if t["userId"] != course["ownerId"]]
+        profesores = [member_label(t) for t in teachers]
         filas.append(
             {
                 "CourseID": course["id"],
                 "Nombre": course.get("name", ""),
                 "Sección": course.get("section", ""),
+                "OwnerID": owner_id,
                 "Profesores": " ".join(profesores),
                 "Alumnos": len(students),
             }
         )
         print(
             f"\n{course['id']}  {course.get('name', '')} / {course.get('section', '')}\n"
+            f"    Propietario eliminado: {owner_id}\n"
             f"    Profesores: {', '.join(profesores) or '(ninguno)'}\n"
             f"    Alumnos: {len(students)}"
         )
@@ -455,7 +465,7 @@ def find_orphans(csv_path=None):
     if csv_path:
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(
-                f, fieldnames=["CourseID", "Nombre", "Sección", "Profesores", "Alumnos"]
+                f, fieldnames=["CourseID", "Nombre", "Sección", "OwnerID", "Profesores", "Alumnos"]
             )
             writer.writeheader()
             writer.writerows(filas)
