@@ -43,6 +43,15 @@ python main.py
 ```
 *Nota: La primera vez se abrirá una ventana en tu navegador para autorizar el acceso a tu cuenta de Google.*
 
+### Agregar un estudiante nuevo
+Cuando llega un estudiante a un curso ya creado, se le puede matricular en todas las asignaturas de su curso (columna *Clase* de la pestaña **Asignaturas**):
+```bash
+python main.py add-student --curso "1°A" --email alumno@colegio.cl
+```
+- `--email` se puede repetir para agregar varios estudiantes del mismo curso.
+- `--dry-run` muestra en qué asignaturas se matricularía, sin modificar Classroom.
+- Usa el *CourseID* (columna H de **Asignaturas**), que la carga inicial (`python main.py` o `python main.py create-courses`) escribe automáticamente. Las asignaturas sin *CourseID* se omiten con un aviso.
+
 ### Notebook Interactivo
 Si prefieres un entorno más visual o paso a paso, utiliza el archivo:
 `google-classroom-admin.ipynb`
