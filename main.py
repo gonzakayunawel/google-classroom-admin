@@ -388,7 +388,28 @@ def list_all(request_fn, key, **kwargs):
 
 def member_label(member):
     """Correo del profesor o alumno, o su userId si no hay correo."""
-    return member.get("profile", {}).get("emailAddress") or member["userId"]
+    label = member.get("profile", {}).get("emailAddress") or member["userId"]
+    if member.get("pendiente"):
+        label += " (invitación pendiente)"
+    return label
+
+
+def pending_invitations(course_id, existing_ids):
+    """Invitaciones pendientes de profesores y alumnos, con la misma forma que un miembro."""
+    invitations = list_all(classroom_service.invitations().list, "invitations", courseId=course_id)
+    pendientes = {"TEACHER": [], "STUDENT": []}
+    for inv in invitations:
+        if inv.get("role") not in pendientes or inv["userId"] in existing_ids:
+            continue
+        try:
+            profile = classroom_service.userProfiles().get(userId=inv["userId"]).execute()
+            email = profile.get("emailAddress")
+        except HttpError:
+            email = None
+        pendientes[inv["role"]].append(
+            {"userId": inv["userId"], "profile": {"emailAddress": email}, "pendiente": True}
+        )
+    return pendientes["TEACHER"], pendientes["STUDENT"]
 
 
 def find_orphans(csv_path=None):
@@ -507,7 +528,7 @@ def find_sheet_row(course_id):
     return None
 
 
-def explain_rebuild(course, profesores, alumnos_clase, owner_email, sheet_row, motivo):
+def explain_rebuild(course, profesores, alumnos_clase, owner_email, sheet_row, motivo, pendientes=0):
     """Explicar qué hará la reconstrucción y qué se pierde. motivo=None en dry-run."""
     nombre = f"{course.get('name', '')} / {course.get('section', '')}"
     if motivo is None:
@@ -520,6 +541,11 @@ def explain_rebuild(course, profesores, alumnos_clase, owner_email, sheet_row, m
     print(f"  1. Crear una clase nueva '{nombre}' con propietario {owner_email}.")
     print(f"  2. Añadir {len(profesores)} profesores: {', '.join(profesores) or '(ninguno)'}")
     print(f"  3. Añadir {len(alumnos_clase)} alumnos:")
+    if pendientes:
+        print(
+            f"     ({pendientes} con invitación pendiente en la clase vieja; "
+            "quedarán inscritos directamente, sin tener que aceptar)"
+        )
     for alumno in alumnos_clase:
         print(f"       - {alumno}")
     if sheet_row:
@@ -606,6 +632,13 @@ def fix_orphans(course_ids, owner="me", dry_run=False):
             resultados.append((course_id, "error al leer"))
             continue
 
+        existing_ids = {m["userId"] for m in teachers + students}
+        try:
+            inv_teachers, inv_students = pending_invitations(course_id, existing_ids)
+        except HttpError as e:
+            print(f"Aviso: no se pudieron leer las invitaciones pendientes; no se copiarán: {e}")
+            inv_teachers, inv_students = [], []
+
         if dry_run:
             motivo = None
         else:
@@ -616,10 +649,15 @@ def fix_orphans(course_ids, owner="me", dry_run=False):
                 continue
 
         excluidos = {course["ownerId"], owner_profile["id"]}
-        profesores = [member_label(t) for t in teachers if t["userId"] not in excluidos]
-        alumnos_clase = [member_label(s) for s in students]
+        all_teachers = teachers + inv_teachers
+        all_students = students + inv_students
+        profesores = [member_label(t) for t in all_teachers if t["userId"] not in excluidos]
+        alumnos_clase = [member_label(s) for s in all_students]
         sheet_row = find_sheet_row(course_id)
-        explain_rebuild(course, profesores, alumnos_clase, owner_email, sheet_row, motivo)
+        explain_rebuild(
+            course, profesores, alumnos_clase, owner_email, sheet_row, motivo,
+            pendientes=len(inv_students),
+        )
 
         if dry_run:
             resultados.append((course_id, "dry-run"))
@@ -635,7 +673,9 @@ def fix_orphans(course_ids, owner="me", dry_run=False):
             continue
 
         try:
-            new_id, errores = rebuild_course(course, teachers, students, owner_profile, sheet_row)
+            new_id, errores = rebuild_course(
+                course, all_teachers, all_students, owner_profile, sheet_row
+            )
             estado = f"reconstruida (ID nuevo: {new_id}, {errores} errores)"
         except HttpError as e:
             print(f"Error creando la clase nueva: {e}")
