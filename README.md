@@ -75,6 +75,16 @@ Si se elimina la cuenta de un profesor sin traspasar antes sus clases, estas que
 
 **Para evitarlo:** antes de eliminar a un profesor, suspende su cuenta y traspasa sus clases a otro profesor.
 
+### Quitar una cuenta de sus clases
+Para sacar a una cuenta (por ejemplo, la de administración) de todas las clases activas donde es co-profesor:
+```bash
+python main.py remove-teacher --email admin@colegio.cl --dry-run   # revisar
+python main.py remove-teacher --email admin@colegio.cl             # pide confirmación [s/N]
+```
+Las clases de las que esa cuenta es propietaria se omiten, porque primero habría que traspasarlas. Los materiales que haya publicado se mantienen.
+
+> Al crear cursos (`create-courses`), el propietario es el profesor de la columna *MailAssociateTeacher*. Si ese correo falta, el propietario es la cuenta autenticada.
+
 ### Notebook Interactivo
 Si prefieres un entorno más visual o paso a paso, utiliza el archivo:
 `google-classroom-admin.ipynb`

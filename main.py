@@ -241,12 +241,23 @@ def create_courses():
         nombre_curso = curso[COLS["CourseName"]]
         print(f"\nProcesando curso: {nombre_curso}")
 
+        # El profesor principal es el propietario; si falta, queda el usuario autenticado
+        email_profesor = curso[COLS["MailAssociateTeacher"]].strip()
+        if "@" in email_profesor:
+            owner_id = email_profesor
+        else:
+            print(
+                f"Email de profesor principal inválido o vacío ({email_profesor!r}); "
+                "el propietario será la cuenta autenticada"
+            )
+            owner_id = "me"
+
         course_data = {
             "name": nombre_curso,
             "section": curso[COLS["Section"]],
             "descriptionHeading": curso[COLS["Description"]],
             "room": curso[COLS["Room"]],
-            "ownerId": "me",  # "me" se refiere al usuario autenticado
+            "ownerId": owner_id,
             "courseState": "ACTIVE",
         }
 
@@ -254,25 +265,8 @@ def create_courses():
             print(f"Creando curso en Classroom: {nombre_curso}")
             course = classroom_service.courses().create(body=course_data).execute()
             course_id = course["id"]
-            print(f"Curso creado: {course['name']} (ID: {course_id})")
+            print(f"Curso creado: {course['name']} (ID: {course_id}, propietario: {owner_id})")
             cursos_creados += 1
-
-            # Añadir profesor principal si es diferente del usuario autenticado
-            if curso[COLS["MailAssociateTeacher"]]:
-                email_profesor = curso[COLS["MailAssociateTeacher"]]
-                if "@" in email_profesor:  # Validación básica de email
-                    teacher_data = {"userId": email_profesor}
-                    try:
-                        classroom_service.courses().teachers().create(
-                            courseId=course_id, body=teacher_data
-                        ).execute()
-                        print(f"Profesor principal {email_profesor} asignado")
-                    except Exception as e:
-                        print(
-                            f"Error asignando profesor principal {email_profesor}: {e}"
-                        )
-                else:
-                    print(f"Email de profesor principal inválido: {email_profesor}")
 
             # Añadir profesor asistente
             if curso[COLS["MailAssistantTeacher"]]:
@@ -687,6 +681,67 @@ def fix_orphans(course_ids, owner="me", dry_run=False):
         print(f"  {course_id}: {estado}")
 
 
+
+# ==============================
+# QUITAR UN PROFESOR DE SUS CLASES
+# ==============================
+
+
+def remove_teacher(email, dry_run=False):
+    """Quitar una cuenta como co-profesor de todas las clases activas donde está."""
+    profile = classroom_service.userProfiles().get(userId=email).execute()
+    user_id = profile["id"]
+    courses = list_all(
+        classroom_service.courses().list,
+        "courses",
+        teacherId=user_id,
+        courseStates=["ACTIVE"],
+        pageSize=100,
+    )
+    propias = [c for c in courses if c["ownerId"] == user_id]
+    ajenas = [c for c in courses if c["ownerId"] != user_id]
+
+    print(f"{email} es profesor en {len(courses)} clases activas.")
+    if propias:
+        print(f"\nSe omiten {len(propias)} clases de las que es propietario (habría que traspasarlas antes):")
+        for c in propias:
+            print(f"  - {c['name']} [{c.get('section', '')}] (ID: {c['id']})")
+
+    print(f"\nSe quitará como co-profesor de {len(ajenas)} clases:")
+    for c in ajenas:
+        print(f"  - {c['name']} [{c.get('section', '')}] (ID: {c['id']})")
+    print("Los materiales que haya publicado se mantienen en cada clase.")
+
+    if dry_run or not ajenas:
+        return
+
+    try:
+        respuesta = input(f"\n¿Quitar a {email} de estas {len(ajenas)} clases? [s/N] ").strip().lower()
+    except EOFError:
+        respuesta = ""
+    if respuesta != "s":
+        print("No se hizo ningún cambio.")
+        return
+
+    quitadas = no_estaba = errores = 0
+    for c in ajenas:
+        try:
+            classroom_service.courses().teachers().delete(
+                courseId=c["id"], userId=user_id
+            ).execute()
+            print(f"Quitado de {c['name']} (ID: {c['id']})")
+            quitadas += 1
+        except HttpError as e:
+            if e.resp.status == 404:
+                print(f"Ya no estaba en {c['name']} (ID: {c['id']})")
+                no_estaba += 1
+            else:
+                print(f"Error quitándolo de {c['name']} (ID: {c['id']}): {e}")
+                errores += 1
+
+    print(f"\nResumen: quitado de {quitadas} clases, {no_estaba} donde ya no estaba, {errores} errores")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Administración de Google Classroom")
     subparsers = parser.add_subparsers(dest="command")
@@ -735,6 +790,15 @@ def parse_args():
         "--dry-run", action="store_true", help="Mostrar qué se haría sin modificar Classroom"
     )
 
+    remove_parser = subparsers.add_parser(
+        "remove-teacher",
+        help="Quitar una cuenta como co-profesor de todas las clases activas donde está",
+    )
+    remove_parser.add_argument("--email", required=True, help="Correo de la cuenta a quitar")
+    remove_parser.add_argument(
+        "--dry-run", action="store_true", help="Mostrar qué se haría sin modificar Classroom"
+    )
+
     return parser.parse_args()
 
 
@@ -746,6 +810,12 @@ if __name__ == "__main__":
     if args.command == "find-orphans":
         print("=== Buscando clases huérfanas ===")
         find_orphans(args.csv)
+        print("=== Programa finalizado ===")
+        sys.exit(0)
+
+    if args.command == "remove-teacher":
+        print("=== Quitando profesor de sus clases ===")
+        remove_teacher(args.email, dry_run=args.dry_run)
         print("=== Programa finalizado ===")
         sys.exit(0)
 
